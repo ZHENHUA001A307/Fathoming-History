@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # 升级到 v4，解决 Node.js 警告
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # 升级到 v5，解决 Node.js 警告
         with:
           python-version: '3.9'
 
@@ -36,77 +36,87 @@ jobs:
           from bs4 import BeautifulSoup
 
           # ================= 配置区 =================
-          READING_SPEED = 250 
-          RSS_SIZE = 15 # 保持在栈内的条目数
-          # 获取仓库信息用于构建图片绝对路径
+          READING_SPEED = 350 
+          RSS_SIZE = 15 
+          # 自动获取环境变量
           repo_full_name = os.getenv('GITHUB_REPOSITORY')
+          # 注意：如果你的默认分支不是 main，请将下方 main 改为你的分支名（如 master）
           base_image_url = f"https://raw.githubusercontent.com/{repo_full_name}/main/image/"
           # ==========================================
 
+          # 确保目录存在
           if not os.path.exists('image'):
-              os.makedirs('image')
+              os.makedirs('image', exist_ok=True)
+          if not os.path.exists('books'):
+              os.makedirs('books', exist_ok=True)
 
-          # 1. 读取进度数字
+          # 1. 读取进度
           try:
               with open('progress.txt', 'r') as f:
                   current_index = int(f.read().strip())
-          except:
+          except Exception:
               current_index = 1
 
-          # 2. 扫描文件夹
+          # 2. 扫描文件
           search_str = f"{current_index:0>3}"
           target_file = None
-          if os.path.exists('books'):
-              for f in os.listdir('books'):
-                  if search_str in f and f.lower().endswith('.epub'):
-                      target_file = os.path.join('books', f)
-                      break
+          for f in os.listdir('books'):
+              if search_str in f and f.lower().endswith('.epub'):
+                  target_file = os.path.join('books', f)
+                  break
 
           if not target_file:
               print(f"DEBUG: 没找到序号 {search_str} 的文件，跳过本次更新。")
               exit(0)
+
+          print(f"开始处理文件: {target_file}")
 
           # 3. 解析内容与提取图片
           content_html = ""
           try:
               book = epub.read_epub(target_file)
               
-              # 提取所有图片并保存
-              # 给图片加前缀防止不同书籍图片同名冲突：idx_filename
+              # 提取并保存图片
               image_map = {}
               for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                  original_name = os.path.basename(item.get_name())
-                  new_name = f"{current_index}_{original_name}"
-                  with open(os.path.join('image', new_name), 'wb') as f:
-                      f.write(item.get_content())
-                  image_map[item.get_name()] = new_name
-
-              # 解析文档
-              for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                  soup = BeautifulSoup(item.get_content(), 'lxml')
+                  # 处理路径名：去掉特殊字符，防止文件系统报错
+                  original_full_path = item.get_name()
+                  safe_name = re.sub(r'[^\w\.-]', '_', os.path.basename(original_full_path))
+                  new_filename = f"{current_index}_{safe_name}"
                   
-                  # 处理图片标签：修正 src 路径为 GitHub Raw 地址
+                  with open(os.path.join('image', new_filename), 'wb') as img_f:
+                      img_f.write(item.get_content())
+                  
+                  # 映射：EPUB内部路径 -> 远程URL路径
+                  image_map[original_full_path] = new_filename
+
+              # 解析文字内容
+              for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+                  # 使用 html.parser 兼容性更好，避免某些环境 lxml 报错
+                  soup = BeautifulSoup(item.get_content().decode('utf-8', 'ignore'), 'html.parser')
+                  
+                  # 修正图片 src
                   for img in soup.find_all('img'):
-                      src = img.get('src', '')
-                      # 匹配 EPUB 内部路径
-                      for original_path, saved_name in image_map.items():
-                          if original_path in src or os.path.basename(src) in original_path:
-                              img['src'] = base_image_url + saved_name
+                      raw_src = img.get('src', '')
+                      # 匹配逻辑：如果 src 包含在 map 的 key 里（处理相对路径差异）
+                      for epub_path, disk_name in image_map.items():
+                          if os.path.basename(raw_src) == os.path.basename(epub_path):
+                              img['src'] = base_image_url + disk_name
                               break
                   
                   body = soup.find('body')
                   if body: 
                       content_html += "".join([str(c) for c in body.contents])
           except Exception as e:
-              print(f"解析出错: {e}")
+              print(f"脚本执行崩溃: {e}")
+              import traceback
+              traceback.print_exc()
               exit(1)
 
-          # 4. 计算阅读时间
+          # 4. 计算字数和时间
           temp_soup = BeautifulSoup(content_html, 'html.parser')
-          pure_text = temp_soup.get_text()
-          word_count = len(pure_text.strip())
+          word_count = len(temp_soup.get_text().strip())
           reading_time = math.ceil(word_count / READING_SPEED)
-          
           time_header = f"<p style='color: #888;'>⏱ 预计阅读时间：{reading_time} 分钟 ({word_count} 字)</p><hr>"
           content_html = time_header + content_html
 
@@ -120,7 +130,7 @@ jobs:
               <guid isPermaLink="false">{current_index}</guid>
           </item>"""
 
-          # 6. 合并并限制 15 条
+          # 6. 合并 RSS
           all_items = [new_item]
           if os.path.exists('feed.xml'):
               with open('feed.xml', 'r', encoding='utf-8') as f:
@@ -131,16 +141,18 @@ jobs:
           all_items = all_items[:RSS_SIZE]
           items_html = "\n".join(all_items)
 
-          # 7. 清理无用图片 (关键步骤)
-          # 获取当前 feed.xml 中引用的所有图片文件名
+          # 7. 清理过期图片
+          # 提取当前 feed 涉及的所有图片名
           needed_images = set(re.findall(r'image/([\w\.-]+)', items_html))
+          print(f"当前保留的图片数量: {len(needed_images)}")
+          
           if os.path.exists('image'):
               for img_file in os.listdir('image'):
                   if img_file not in needed_images:
                       os.remove(os.path.join('image', img_file))
-                      print(f"Cleanup: Deleted {img_file}")
+                      print(f"清理无用图片: {img_file}")
 
-          # 8. 写回 RSS
+          # 8. 生成最终 RSS
           rss_feed = f"""<?xml version="1.0" encoding="UTF-8" ?>
           <rss version="2.0">
           <channel>
@@ -154,7 +166,7 @@ jobs:
           with open('feed.xml', 'w', encoding='utf-8') as f:
               f.write(rss_feed)
 
-          # 9. 更新进度
+          # 9. 保存进度
           with open('progress.txt', 'w') as f:
               f.write(str(current_index + 1))
           EOF
@@ -163,7 +175,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # 确保添加 image 文件夹及其内容的变动
+          # 确保 image 目录被追踪
           git add feed.xml progress.txt image/
-          git commit -m "Update RSS: Added content with images and cleaned up old assets" || echo "Nothing to commit"
+          git commit -m "Update RSS: content & images" || echo "Nothing to commit"
           git push
