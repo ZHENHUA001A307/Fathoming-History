@@ -29,17 +29,22 @@ jobs:
           import os
           import datetime
           import ebooklib
-          import zipfile
           import re
           import math
+          import shutil
           from ebooklib import epub
           from bs4 import BeautifulSoup
 
           # ================= 配置区 =================
-          # 您可以根据自己的阅读习惯调整这里的数字
-          # 普通人中文阅读速度约为 300-500 字/分钟
           READING_SPEED = 250 
+          RSS_SIZE = 15 # 保持在栈内的条目数
+          # 获取仓库信息用于构建图片绝对路径
+          repo_full_name = os.getenv('GITHUB_REPOSITORY')
+          base_image_url = f"https://raw.githubusercontent.com/{repo_full_name}/main/image/"
           # ==========================================
+
+          if not os.path.exists('image'):
+              os.makedirs('image')
 
           # 1. 读取进度数字
           try:
@@ -61,40 +66,51 @@ jobs:
               print(f"DEBUG: 没找到序号 {search_str} 的文件，跳过本次更新。")
               exit(0)
 
-          # 3. 解析内容 (带崩溃恢复)
+          # 3. 解析内容与提取图片
           content_html = ""
           try:
               book = epub.read_epub(target_file)
-              for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                  soup = BeautifulSoup(item.get_content(), 'html.parser')
-                  for img in soup.find_all('img'): img.decompose()
-                  body = soup.find('body')
-                  if body: content_html += "".join([str(c) for c in body.contents])
-          except:
-              with zipfile.ZipFile(target_file, 'r') as z:
-                  content_files = sorted([f for f in z.namelist() if f.lower().endswith(('.html', '.xhtml'))])
-                  for f_name in content_files:
-                      with z.open(f_name) as f:
-                          soup = BeautifulSoup(f.read(), 'html.parser')
-                          for img in soup.find_all('img'): img.decompose()
-                          body = soup.find('body')
-                          if body: content_html += "".join([str(c) for c in body.contents])
+              
+              # 提取所有图片并保存
+              # 给图片加前缀防止不同书籍图片同名冲突：idx_filename
+              image_map = {}
+              for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+                  original_name = os.path.basename(item.get_name())
+                  new_name = f"{current_index}_{original_name}"
+                  with open(os.path.join('image', new_name), 'wb') as f:
+                      f.write(item.get_content())
+                  image_map[item.get_name()] = new_name
 
-          # --- 计算阅读时间逻辑 ---
-          # 1. 临时去掉 HTML 标签统计纯文字字数
+              # 解析文档
+              for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+                  soup = BeautifulSoup(item.get_content(), 'lxml')
+                  
+                  # 处理图片标签：修正 src 路径为 GitHub Raw 地址
+                  for img in soup.find_all('img'):
+                      src = img.get('src', '')
+                      # 匹配 EPUB 内部路径
+                      for original_path, saved_name in image_map.items():
+                          if original_path in src or os.path.basename(src) in original_path:
+                              img['src'] = base_image_url + saved_name
+                              break
+                  
+                  body = soup.find('body')
+                  if body: 
+                      content_html += "".join([str(c) for c in body.contents])
+          except Exception as e:
+              print(f"解析出错: {e}")
+              exit(1)
+
+          # 4. 计算阅读时间
           temp_soup = BeautifulSoup(content_html, 'html.parser')
           pure_text = temp_soup.get_text()
           word_count = len(pure_text.strip())
-          
-          # 2. 计算分钟（向上取整）
           reading_time = math.ceil(word_count / READING_SPEED)
           
-          # 3. 构造时间提示行，并拼接到正文最前面
           time_header = f"<p style='color: #888;'>⏱ 预计阅读时间：{reading_time} 分钟 ({word_count} 字)</p><hr>"
           content_html = time_header + content_html
-          # -----------------------
 
-          # 4. 构造当前的新条目 (New Item)
+          # 5. 构造新条目
           pub_date = datetime.datetime.now().strftime('%a, %d %b %Y %H:%M:%S +0000')
           file_name = os.path.basename(target_file)
           new_item = f"""        <item>
@@ -104,7 +120,7 @@ jobs:
               <guid isPermaLink="false">{current_index}</guid>
           </item>"""
 
-          # 5. 读取旧条目并合并
+          # 6. 合并并限制 15 条
           all_items = [new_item]
           if os.path.exists('feed.xml'):
               with open('feed.xml', 'r', encoding='utf-8') as f:
@@ -112,16 +128,24 @@ jobs:
                   old_items = re.findall(r'<item>.*?</item>', old_feed, re.DOTALL)
                   all_items.extend(old_items)
 
-          # 只保留最近 15 条
-          all_items = all_items[:15]
+          all_items = all_items[:RSS_SIZE]
           items_html = "\n".join(all_items)
 
-          # 6. 生成最终的 RSS 文件
+          # 7. 清理无用图片 (关键步骤)
+          # 获取当前 feed.xml 中引用的所有图片文件名
+          needed_images = set(re.findall(r'image/([\w\.-]+)', items_html))
+          if os.path.exists('image'):
+              for img_file in os.listdir('image'):
+                  if img_file not in needed_images:
+                      os.remove(os.path.join('image', img_file))
+                      print(f"Cleanup: Deleted {img_file}")
+
+          # 8. 写回 RSS
           rss_feed = f"""<?xml version="1.0" encoding="UTF-8" ?>
           <rss version="2.0">
           <channel>
               <title>我的每日小说</title>
-              <link>https://github.com/${{ github.repository }}</link>
+              <link>https://github.com/{repo_full_name}</link>
               <description>从 EPUB 自动生成的 RSS 订阅源</description>
           {items_html}
           </channel>
@@ -130,7 +154,7 @@ jobs:
           with open('feed.xml', 'w', encoding='utf-8') as f:
               f.write(rss_feed)
 
-          # 7. 更新进度
+          # 9. 更新进度
           with open('progress.txt', 'w') as f:
               f.write(str(current_index + 1))
           EOF
@@ -139,6 +163,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add feed.xml progress.txt
-          git commit -m "Update RSS: Added chapter with reading time" || echo "Nothing to commit"
+          # 确保添加 image 文件夹及其内容的变动
+          git add feed.xml progress.txt image/
+          git commit -m "Update RSS: Added content with images and cleaned up old assets" || echo "Nothing to commit"
           git push
